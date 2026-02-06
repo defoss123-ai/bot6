@@ -36,12 +36,11 @@ class PairWorker:
         self.invested_usdt = float(initial_stats.get("invested_usdt", 0.0))
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._exchange = ccxt.binance(
+        self._exchange = ccxt.mexc(
             {
                 "apiKey": api_key,
                 "secret": api_secret,
                 "enableRateLimit": True,
-                "options": {"defaultType": "spot"},
             }
         )
         self._state = "IDLE"

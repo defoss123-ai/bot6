@@ -128,7 +128,7 @@ class App:
 
         self.api_status_label.config(text="—")
         self.api_details_label.config(text="Детали: Проверка...")
-        self.logger.info("API check started (binance spot)")
+        self.logger.info("API check started (mexc spot)")
         thread = threading.Thread(
             target=self._run_api_check,
             args=(api_key, api_secret),
@@ -396,7 +396,7 @@ class App:
             threshold = float(self.rsi_value_entry.get().strip())
             period = int(self.rsi_period_entry.get().strip())
             timeframe = self.rsi_timeframe.get().strip() or "15m"
-            exchange = ccxt.binance()
+            exchange = ccxt.mexc()
             rsi_value = get_rsi(exchange, symbol, timeframe, period)
             condition_met = rsi_value < threshold
             self.rsi_current_label.config(text=f"Текущий RSI: {rsi_value:.2f}")
@@ -725,12 +725,11 @@ class App:
 
     def _run_api_check(self, api_key: str, api_secret: str) -> None:
         try:
-            exchange = ccxt.binance(
+            exchange = ccxt.mexc(
                 {
                     "apiKey": api_key,
                     "secret": api_secret,
                     "enableRateLimit": True,
-                    "options": {"defaultType": "spot"},
                 }
             )
             exchange.fetch_balance()
