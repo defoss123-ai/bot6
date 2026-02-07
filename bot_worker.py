@@ -162,6 +162,12 @@ class PairWorker:
                                 amount_base,
                                 entry_limit_price,
                             )
+                        order_ok, order = self._safe_ccxt_call(
+                            self._exchange.create_limit_buy_order,
+                            self.pair,
+                            amount_base,
+                            entry_limit_price,
+                        )
                         if order_ok:
                             self.entry_order_id = str(order.get("id") or "")
                             self.entry_active = bool(self.entry_order_id)
