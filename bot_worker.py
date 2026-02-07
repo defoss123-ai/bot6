@@ -56,6 +56,7 @@ class PairWorker:
         self._accounted_safety_ids: set[str] = set()
         self._last_entry_log = 0.0
         self._last_tp_log = 0.0
+        self._last_tp_attempt = 0.0
         self._last_heartbeat = 0.0
         self._last_ticker_time = 0.0
         self._order_poll_times: dict[str, float] = {}
@@ -162,12 +163,6 @@ class PairWorker:
                                 amount_base,
                                 entry_limit_price,
                             )
-                        order_ok, order = self._safe_ccxt_call(
-                            self._exchange.create_limit_buy_order,
-                            self.pair,
-                            amount_base,
-                            entry_limit_price,
-                        )
                         if order_ok:
                             self.entry_order_id = str(order.get("id") or "")
                             self.entry_active = bool(self.entry_order_id)
@@ -224,17 +219,8 @@ class PairWorker:
                                         self.safety_order_ids.append(str(safety_id))
                             self._safety_placed = True
 
-                        tp_price = self._avg_price * (1 + take_profit_pct / 100)
                         if not self.tp_active:
-                            tp_ok, tp_order = self._safe_ccxt_call(
-                                self._exchange.create_limit_sell_order,
-                                self.pair,
-                                self._position_qty,
-                                tp_price,
-                            )
-                            if tp_ok:
-                                self.tp_order_id = str(tp_order.get("id") or "")
-                                self.tp_active = bool(self.tp_order_id)
+                            self._place_take_profit_order(take_profit_pct)
                         self._state = "TP_PLACED"
                         self.logger.info("Entry filled for %s; TP placed.", self.pair)
                     elif status == "partial":
@@ -244,6 +230,10 @@ class PairWorker:
                             self._last_entry_log = now
 
             elif self._state == "TP_PLACED":
+                now = time.time()
+                if not self.tp_active and now - self._last_tp_attempt >= 5:
+                    self._last_tp_attempt = now
+                    self._place_take_profit_order(take_profit_pct)
                 if self.tp_order_id and self.tp_active:
                     tp_order = self._safe_fetch_order(self.tp_order_id)
                     if tp_order and tp_order.get("status") == "closed":
@@ -317,21 +307,10 @@ class PairWorker:
                             if cancel_ok:
                                 self.tp_active = False
                         if not self.tp_active:
-                            tp_price = self._avg_price * (1 + take_profit_pct / 100)
-                            tp_ok, tp_order = self._safe_ccxt_call(
-                                self._exchange.create_limit_sell_order,
-                                self.pair,
-                                self._position_qty,
-                                tp_price,
-                            )
-                            if tp_ok:
-                                self.tp_order_id = str(tp_order.get("id") or "")
-                                self.tp_active = bool(self.tp_order_id)
-                                self.logger.info("TP updated for %s", self.pair)
+                            self._place_take_profit_order(take_profit_pct)
                     elif status == "partial":
                         self.logger.warning("Safety order partial for %s (id=%s)", self.pair, safety_id)
 
-                now = time.time()
                 if now - self._last_tp_log >= 20:
                     self._last_tp_log = now
                     self.logger.info("Monitoring TP for %s", self.pair)
@@ -364,6 +343,76 @@ class PairWorker:
         if not ok:
             return None
         return result
+
+    def _place_take_profit_order(self, take_profit_pct: float) -> bool:
+        if self.tp_active and self.tp_order_id:
+            return True
+
+        market_ok, _ = self._safe_ccxt_call(self._exchange.load_markets)
+        if not market_ok:
+            self.logger.warning("TP placement skipped for %s: failed to load markets", self.pair)
+            return False
+
+        market = self._exchange.market(self.pair) or {}
+        base_asset = market.get("base")
+        if not base_asset and "/" in self.pair:
+            base_asset = self.pair.split("/")[0]
+
+        if not base_asset:
+            self.logger.warning("TP placement skipped for %s: cannot определить base-актив", self.pair)
+            return False
+
+        tp_price_raw = self._avg_price * (1 + take_profit_pct / 100)
+        price_precise = float(self._exchange.price_to_precision(self.pair, tp_price_raw))
+
+        for attempt in range(1, 4):
+            bal_ok, balance = self._safe_ccxt_call(self._exchange.fetch_balance)
+            if not bal_ok:
+                self.logger.warning("TP placement attempt %s failed: balance not доступен", attempt)
+                time.sleep(1.5)
+                continue
+
+            free_qty = float((balance.get("free", {}) or {}).get(base_asset, 0.0) or 0.0)
+            sell_qty_raw = min(self._position_qty, free_qty) * 0.999
+            sell_qty_precise = float(self._exchange.amount_to_precision(self.pair, sell_qty_raw))
+
+            self.logger.info(
+                "TP calc for %s: avg_price=%.6f tp_price=%.6f "
+                "position_qty=%.8f free_qty=%.8f sell_qty_raw=%.8f sell_qty_precise=%.8f",
+                self.pair,
+                self._avg_price,
+                tp_price_raw,
+                self._position_qty,
+                free_qty,
+                sell_qty_raw,
+                sell_qty_precise,
+            )
+
+            if sell_qty_precise <= 0:
+                self.logger.warning(
+                    "TP placement skipped for %s: insufficient free qty (%.8f)",
+                    self.pair,
+                    free_qty,
+                )
+                time.sleep(1.5)
+                continue
+
+            order_ok, order = self._safe_ccxt_call(
+                self._exchange.create_limit_sell_order,
+                self.pair,
+                sell_qty_precise,
+                price_precise,
+            )
+            if order_ok:
+                self.tp_order_id = str(order.get("id") or "")
+                self.tp_active = bool(self.tp_order_id)
+                self.logger.info("TP order placed for %s (id=%s)", self.pair, self.tp_order_id)
+                return True
+
+            self.logger.warning("TP placement attempt %s failed for %s", attempt, self.pair)
+            time.sleep(1.5)
+
+        return False
 
     def _cancel_open_orders(self, exclude_tp: bool = False) -> None:
         order_ids = []
