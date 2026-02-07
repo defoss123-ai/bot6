@@ -116,6 +116,7 @@ class PairWorker:
             volume_multiplier = float(strategy.get("volume_multiplier", 1.0))
             fee_pct = float(strategy.get("fee_pct", 0.1))
             use_safety = bool(strategy.get("use_safety_orders", True))
+            use_market_entry = bool(strategy.get("use_market_entry", False))
 
             if self._state == "IDLE":
                 can_enter = True
@@ -148,6 +149,19 @@ class PairWorker:
                     entry_limit_price = current_price * 0.999
                     amount_base = base_order_usdt / entry_limit_price
                     if not self.entry_active:
+                        if use_market_entry:
+                            order_ok, order = self._safe_ccxt_call(
+                                self._exchange.create_market_buy_order,
+                                self.pair,
+                                amount_base,
+                            )
+                        else:
+                            order_ok, order = self._safe_ccxt_call(
+                                self._exchange.create_limit_buy_order,
+                                self.pair,
+                                amount_base,
+                                entry_limit_price,
+                            )
                         order_ok, order = self._safe_ccxt_call(
                             self._exchange.create_limit_buy_order,
                             self.pair,
@@ -160,9 +174,9 @@ class PairWorker:
                             self._entry_price = entry_limit_price
                             self._state = "ENTRY_PLACED"
                             self.logger.info(
-                                "Entry order placed for %s at %.6f (id=%s)",
+                                "Entry order placed for %s (%s) (id=%s)",
                                 self.pair,
-                                entry_limit_price,
+                                "market" if use_market_entry else f"limit {entry_limit_price:.6f}",
                                 self.entry_order_id,
                             )
 
@@ -185,6 +199,7 @@ class PairWorker:
                         self._total_cost = cost
                         self._position_qty = filled
                         self._avg_price = self._total_cost / self._position_qty
+                        self._entry_price = self._avg_price
                         self._next_safety_index = 0
                         self.safety_order_ids = []
                         self._accounted_safety_ids.clear()

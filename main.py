@@ -311,18 +311,27 @@ class App:
         )
         safety_check.grid(row=len(fields), column=0, columnspan=2, padx=8, pady=6, sticky=tk.W)
 
+        self.use_market_entry_var = tk.BooleanVar(value=False)
+        market_entry_check = ttk.Checkbutton(
+            self.settings_frame,
+            text="Первый ордер — Market",
+            variable=self.use_market_entry_var,
+        )
+        market_entry_check.grid(row=len(fields) + 1, column=0, columnspan=2, padx=8, pady=4, sticky=tk.W)
+
         save_button = ttk.Button(
             self.settings_frame,
             text="Сохранить настройки",
             command=self._save_settings,
         )
-        save_button.grid(row=len(fields) + 1, column=0, columnspan=2, pady=8)
+        save_button.grid(row=len(fields) + 2, column=0, columnspan=2, pady=8)
 
     def _save_settings(self) -> None:
         if not self._validate_strategy_inputs(for_save=True):
             return
         self.settings_data = {key: entry.get().strip() for key, entry in self.settings_entries.items()}
         self.settings_data["use_safety_orders"] = str(self.use_safety_var.get())
+        self.settings_data["use_market_entry"] = str(self.use_market_entry_var.get())
         self.logger.info("Strategy settings saved: %s", self.settings_data)
         self._save_state()
 
@@ -790,6 +799,7 @@ class App:
                 "price_range_pct": "",
                 "fee_pct": 0.1,
                 "use_safety_orders": True,
+                "use_market_entry": False,
             },
             "rsi": {
                 "enabled": False,
@@ -824,6 +834,7 @@ class App:
         self.settings_entries["fee"].delete(0, tk.END)
         self.settings_entries["fee"].insert(0, str(strategy.get("fee_pct", 0.1)))
         self.use_safety_var.set(bool(strategy.get("use_safety_orders", True)))
+        self.use_market_entry_var.set(bool(strategy.get("use_market_entry", False)))
 
         rsi = self.state.get("rsi", {})
         self.use_rsi_var.set(bool(rsi.get("enabled", False)))
@@ -887,6 +898,7 @@ class App:
             "price_range_pct": self.settings_entries["price_range"].get().strip(),
             "fee_pct": self.settings_entries["fee"].get().strip(),
             "use_safety_orders": bool(self.use_safety_var.get()),
+            "use_market_entry": bool(self.use_market_entry_var.get()),
         }
 
         def to_float(value: str, default: float) -> float | str:
@@ -912,6 +924,7 @@ class App:
             "price_range_pct": to_float(strategy["price_range_pct"], ""),
             "fee_pct": to_float(strategy["fee_pct"], 0.1),
             "use_safety_orders": strategy["use_safety_orders"],
+            "use_market_entry": strategy["use_market_entry"],
         }
 
         rsi_threshold = self.rsi_value_entry.get().strip()
