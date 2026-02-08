@@ -220,7 +220,7 @@ class PairWorker:
                             self._safety_placed = True
 
                         if not self.tp_active:
-                            self._place_take_profit_order(take_profit_pct)
+                            self._place_take_profit_order(take_profit_pct, reason="entry")
                         self._state = "TP_PLACED"
                         self.logger.info("Entry filled for %s; TP placed.", self.pair)
                     elif status == "partial":
@@ -233,34 +233,57 @@ class PairWorker:
                 now = time.time()
                 if not self.tp_active and now - self._last_tp_attempt >= 5:
                     self._last_tp_attempt = now
+                    self._place_take_profit_order(take_profit_pct, reason="retry")
                     self._place_take_profit_order(take_profit_pct)
                 if self.tp_order_id and self.tp_active:
                     tp_order = self._safe_fetch_order(self.tp_order_id)
                     if tp_order and tp_order.get("status") == "closed":
                         self.tp_active = False
+                        self.tp_order_id = None
                         sell_return = float(tp_order.get("cost") or 0)
-                        if sell_return <= 0:
-                            sell_return = float(tp_order.get("filled") or 0) * float(
-                                tp_order.get("average") or self._avg_price
-                            )
+                        filled_qty = float(tp_order.get("filled") or 0)
+                        avg_sell_price = float(tp_order.get("average") or tp_order.get("price") or 0)
+                        if sell_return <= 0 and filled_qty > 0:
+                            sell_return = filled_qty * avg_sell_price
+                        cost_basis = filled_qty * self._avg_price
                         fee_rate = fee_pct / 100
-                        fees = (self._total_cost * fee_rate) + (sell_return * fee_rate)
-                        profit = sell_return - self._total_cost - fees
-                        profit_pct = (profit / self._total_cost) * 100 if self._total_cost else 0.0
+                        fees = (cost_basis * fee_rate) + (sell_return * fee_rate)
+                        profit = sell_return - cost_basis - fees
+                        profit_pct = (profit / cost_basis) * 100 if cost_basis else 0.0
                         self.pnl_usdt += profit
-                        self.invested_usdt += self._total_cost
+                        self.invested_usdt += cost_basis
                         if self.invested_usdt > 0:
                             self.pnl_pct = (self.pnl_usdt / self.invested_usdt) * 100
                         else:
                             self.pnl_pct = 0.0
                         self.closed_trades += 1
-                        self._cancel_open_orders(exclude_tp=True)
-                        self.entry_order_id = None
-                        self.tp_order_id = None
-                        self.safety_order_ids = []
-                        self._accounted_safety_ids.clear()
-                        self._safety_placed = False
-                        self._state = "IDLE"
+                        epsilon = 1e-12
+                        self.logger.info(
+                            "TP filled for %s: filled_qty=%.8f sell_return=%.8f cost_basis=%.8f "
+                            "profit=%.8f new_state=%s",
+                            self.pair,
+                            filled_qty,
+                            sell_return,
+                            cost_basis,
+                            profit,
+                            "IDLE" if filled_qty >= self._position_qty - epsilon else "IN_POSITION",
+                        )
+                        if filled_qty >= self._position_qty - epsilon:
+                            self._cancel_open_orders(exclude_tp=True)
+                            self.entry_order_id = None
+                            self.tp_order_id = None
+                            self.safety_order_ids = []
+                            self._accounted_safety_ids.clear()
+                            self._safety_placed = False
+                            self._position_qty = 0.0
+                            self._total_cost = 0.0
+                            self._avg_price = 0.0
+                            self._state = "IDLE"
+                        else:
+                            self._position_qty = max(0.0, self._position_qty - filled_qty)
+                            self._total_cost = self._avg_price * self._position_qty
+                            self.tp_active = False
+                            self._place_take_profit_order(take_profit_pct, reason="partial_tp")
                         self.logger.info(
                             "TP HIT for %s: profit=%.4f (%.2f%%)",
                             self.pair,
@@ -306,8 +329,9 @@ class PairWorker:
                             )
                             if cancel_ok:
                                 self.tp_active = False
+                                self.tp_order_id = None
                         if not self.tp_active:
-                            self._place_take_profit_order(take_profit_pct)
+                            self._place_take_profit_order(take_profit_pct, reason="safety_update")
                     elif status == "partial":
                         self.logger.warning("Safety order partial for %s (id=%s)", self.pair, safety_id)
 
@@ -344,7 +368,7 @@ class PairWorker:
             return None
         return result
 
-    def _place_take_profit_order(self, take_profit_pct: float) -> bool:
+    def _place_take_profit_order(self, take_profit_pct: float, reason: str) -> bool:
         if self.tp_active and self.tp_order_id:
             return True
 
@@ -362,6 +386,14 @@ class PairWorker:
             self.logger.warning("TP placement skipped for %s: cannot определить base-актив", self.pair)
             return False
 
+        min_qty = float((market.get("limits", {}) or {}).get("amount", {}).get("min") or 0.0)
+        min_cost = float((market.get("limits", {}) or {}).get("cost", {}).get("min") or 0.0)
+        amount_precision = (market.get("precision", {}) or {}).get("amount")
+        step = 0.0
+        if isinstance(amount_precision, int):
+            step = 10 ** (-amount_precision)
+        safety_margin = max(step * 2, 0.0)
+
         tp_price_raw = self._avg_price * (1 + take_profit_pct / 100)
         price_precise = float(self._exchange.price_to_precision(self.pair, tp_price_raw))
 
@@ -373,13 +405,15 @@ class PairWorker:
                 continue
 
             free_qty = float((balance.get("free", {}) or {}).get(base_asset, 0.0) or 0.0)
-            sell_qty_raw = min(self._position_qty, free_qty) * 0.999
+            sell_qty_raw = min(self._position_qty, free_qty)
+            sell_qty_raw = max(0.0, sell_qty_raw - safety_margin)
             sell_qty_precise = float(self._exchange.amount_to_precision(self.pair, sell_qty_raw))
 
             self.logger.info(
-                "TP calc for %s: avg_price=%.6f tp_price=%.6f "
+                "TP calc for %s: reason=%s avg_price=%.6f tp_price=%.6f "
                 "position_qty=%.8f free_qty=%.8f sell_qty_raw=%.8f sell_qty_precise=%.8f",
                 self.pair,
+                reason,
                 self._avg_price,
                 tp_price_raw,
                 self._position_qty,
@@ -388,11 +422,22 @@ class PairWorker:
                 sell_qty_precise,
             )
 
-            if sell_qty_precise <= 0:
+            if sell_qty_precise <= 0 or sell_qty_precise < min_qty:
                 self.logger.warning(
                     "TP placement skipped for %s: insufficient free qty (%.8f)",
                     self.pair,
                     free_qty,
+                )
+                time.sleep(1.5)
+                continue
+
+            if min_cost and sell_qty_precise * price_precise < min_cost:
+                self.logger.warning(
+                    "TP placement skipped for %s: min cost not met (qty=%.8f price=%.8f min_cost=%.8f)",
+                    self.pair,
+                    sell_qty_precise,
+                    price_precise,
+                    min_cost,
                 )
                 time.sleep(1.5)
                 continue
@@ -409,6 +454,18 @@ class PairWorker:
                 self.logger.info("TP order placed for %s (id=%s)", self.pair, self.tp_order_id)
                 return True
 
+            error_text = str(order).lower()
+            if "insufficient position" in error_text:
+                self.logger.warning(
+                    "TP insufficient position for %s: free_qty=%.8f position_qty=%.8f tp_qty=%.8f "
+                    "min_qty=%.8f step=%.8f",
+                    self.pair,
+                    free_qty,
+                    self._position_qty,
+                    sell_qty_precise,
+                    min_qty,
+                    step,
+                )
             self.logger.warning("TP placement attempt %s failed for %s", attempt, self.pair)
             time.sleep(1.5)
 
