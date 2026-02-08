@@ -234,6 +234,7 @@ class PairWorker:
                 if not self.tp_active and now - self._last_tp_attempt >= 5:
                     self._last_tp_attempt = now
                     self._place_take_profit_order(take_profit_pct, reason="retry")
+                    self._place_take_profit_order(take_profit_pct)
                 if self.tp_order_id and self.tp_active:
                     tp_order = self._safe_fetch_order(self.tp_order_id)
                     if tp_order and tp_order.get("status") == "closed":
