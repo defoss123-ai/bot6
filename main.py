@@ -93,11 +93,22 @@ class App:
         self.api_secret_entry = ttk.Entry(self.api_frame, width=40, show="*")
         self.api_secret_entry.grid(row=1, column=1, padx=8, pady=6, sticky=tk.W)
 
+        ttk.Label(self.api_frame, text="Биржа").grid(row=2, column=0, sticky=tk.W, padx=8, pady=6)
+        self.exchange_var = tk.StringVar(value="MEXC")
+        self.exchange_combo = ttk.Combobox(
+            self.api_frame,
+            textvariable=self.exchange_var,
+            values=list(self._exchange_labels.keys()),
+            width=15,
+            state="readonly",
+        )
+        self.exchange_combo.grid(row=2, column=1, sticky=tk.W, padx=8, pady=6)
+
         self.api_status_label = ttk.Label(self.api_frame, text="—")
-        self.api_status_label.grid(row=2, column=1, sticky=tk.W, padx=8, pady=6)
+        self.api_status_label.grid(row=3, column=1, sticky=tk.W, padx=8, pady=6)
 
         self.api_details_label = ttk.Label(self.api_frame, text="Детали: —")
-        self.api_details_label.grid(row=3, column=1, sticky=tk.W, padx=8, pady=4)
+        self.api_details_label.grid(row=4, column=1, sticky=tk.W, padx=8, pady=4)
 
         self.save_credentials_var = tk.BooleanVar(value=False)
         save_credentials_check = ttk.Checkbutton(
@@ -106,18 +117,20 @@ class App:
             variable=self.save_credentials_var,
             command=self._save_state,
         )
-        save_credentials_check.grid(row=4, column=0, columnspan=2, padx=8, pady=4, sticky=tk.W)
+        save_credentials_check.grid(row=5, column=0, columnspan=2, padx=8, pady=4, sticky=tk.W)
 
         check_button = ttk.Button(
             self.api_frame,
             text="Проверить подключение",
             command=self._handle_api_check,
         )
-        check_button.grid(row=2, column=0, padx=8, pady=6, sticky=tk.W)
+        check_button.grid(row=3, column=0, padx=8, pady=6, sticky=tk.W)
 
     def _handle_api_check(self) -> None:
         api_key = self.api_key_entry.get().strip()
         api_secret = self.api_secret_entry.get().strip()
+        exchange_label = self.exchange_var.get() or "MEXC"
+        exchange_id = self._exchange_labels.get(exchange_label, "mexc")
         if not api_key or not api_secret:
             self.api_status_label.config(text="ERROR")
             self.api_details_label.config(text="Детали: Пустые ключи")
@@ -128,10 +141,10 @@ class App:
 
         self.api_status_label.config(text="—")
         self.api_details_label.config(text="Детали: Проверка...")
-        self.logger.info("API check started (mexc spot)")
+        self.logger.info("API check started (%s spot)", exchange_id)
         thread = threading.Thread(
             target=self._run_api_check,
-            args=(api_key, api_secret),
+            args=(exchange_id, api_key, api_secret),
             daemon=True,
         )
         thread.start()
@@ -182,7 +195,7 @@ class App:
         pair_entry.grid(row=0, column=1, padx=8, pady=8)
 
         def confirm() -> None:
-            pair_value = pair_entry.get().strip()
+            pair_value = normalize_symbol(pair_entry.get().strip())
             if pair_value:
                 self.pairs_tree.insert(
                     "",
@@ -218,7 +231,7 @@ class App:
         selected = self._get_selected_pair()
         if selected:
             values = list(self.pairs_tree.item(selected, "values"))
-            pair = str(values[0])
+            pair = normalize_symbol(str(values[0]))
             api_key = self.api_key_entry.get().strip()
             api_secret = self.api_secret_entry.get().strip()
             if not api_key or not api_secret:
@@ -228,6 +241,18 @@ class App:
             if not self._validate_strategy_inputs(for_save=False):
                 messagebox.showwarning("Настройки", "Сначала сохраните корректные настройки стратегии.")
                 self.logger.warning("Cannot start worker for %s: invalid strategy settings.", pair)
+                return
+            exchange_label = self.exchange_var.get() or "MEXC"
+            exchange_id = self._exchange_labels.get(exchange_label, "mexc")
+            try:
+                exchange = build_exchange(exchange_id, api_key, api_secret)
+            except Exception as exc:
+                messagebox.showerror("Биржа", f"Не удалось загрузить рынки: {exc}")
+                self.logger.error("Failed to load markets for %s: %s", exchange_id, exc)
+                return
+            if pair not in exchange.markets:
+                messagebox.showwarning("Пара", f"Пара {pair} не найдена на бирже {exchange_label}.")
+                self.logger.warning("Symbol %s not found on %s", pair, exchange_id)
                 return
             worker = self.workers.get(pair)
             if worker is None:
@@ -399,13 +424,20 @@ class App:
             return
 
         values = self.pairs_tree.item(selected, "values")
-        symbol = str(values[0])
+        symbol = normalize_symbol(str(values[0]))
+        if symbol != values[0]:
+            values = list(values)
+            values[0] = symbol
+            self.pairs_tree.item(selected, values=values)
+            self._save_state()
 
         try:
             threshold = float(self.rsi_value_entry.get().strip())
             period = int(self.rsi_period_entry.get().strip())
             timeframe = self.rsi_timeframe.get().strip() or "15m"
-            exchange = ccxt.mexc()
+            exchange_label = self.exchange_var.get() or "MEXC"
+            exchange_id = self._exchange_labels.get(exchange_label, "mexc")
+            exchange = build_exchange(exchange_id, "", "")
             rsi_value = get_rsi(exchange, symbol, timeframe, period)
             condition_met = rsi_value < threshold
             self.rsi_current_label.config(text=f"Текущий RSI: {rsi_value:.2f}")
@@ -732,15 +764,9 @@ class App:
             elif event.get("type") == "api_check_result":
                 self._handle_api_check_result(event)
 
-    def _run_api_check(self, api_key: str, api_secret: str) -> None:
+    def _run_api_check(self, exchange_id: str, api_key: str, api_secret: str) -> None:
         try:
-            exchange = ccxt.mexc(
-                {
-                    "apiKey": api_key,
-                    "secret": api_secret,
-                    "enableRateLimit": True,
-                }
-            )
+            exchange = build_exchange(exchange_id, api_key, api_secret)
             exchange.fetch_balance()
             self.worker_event_queue.put(
                 {"type": "api_check_result", "ok": True, "message": "OK"}
@@ -759,7 +785,7 @@ class App:
             return
         error_detail = event.get("error", "Unknown error")
         self.api_status_label.config(text="ERROR")
-        self.api_details_label.config(text="Детали: Ошибка")
+        self.api_details_label.config(text=f"Детали: {error_detail}")
         messagebox.showerror("API", "Не удалось проверить ключи API.")
         self.logger.error("API check ERROR: %s", error_detail)
 
@@ -789,7 +815,7 @@ class App:
 
     def _default_state(self) -> dict:
         return {
-            "api": {"key": "", "secret": "", "save_credentials": False},
+            "api": {"exchange_id": "mexc", "key": "", "secret": "", "save_credentials": False},
             "strategy": {
                 "take_profit_pct": 1.0,
                 "base_order_usdt": 10.0,
@@ -820,6 +846,12 @@ class App:
 
         self._pair_stats: dict[str, dict[str, float]] = {}
         api_state = self.state.get("api", {})
+        exchange_id = str(api_state.get("exchange_id", "mexc")).lower()
+        exchange_label = next(
+            (label for label, ex_id in self._exchange_labels.items() if ex_id == exchange_id),
+            "MEXC",
+        )
+        self.exchange_var.set(exchange_label)
         self.api_key_entry.insert(0, api_state.get("key", ""))
         self.api_secret_entry.insert(0, api_state.get("secret", ""))
         self.save_credentials_var.set(bool(api_state.get("save_credentials", False)))
@@ -885,6 +917,8 @@ class App:
         api_key = self.api_key_entry.get().strip()
         api_secret = self.api_secret_entry.get().strip()
         save_credentials = bool(self.save_credentials_var.get())
+        exchange_label = self.exchange_var.get() or "MEXC"
+        exchange_id = self._exchange_labels.get(exchange_label, "mexc")
         if not save_credentials:
             api_key = ""
             api_secret = ""
@@ -938,6 +972,7 @@ class App:
 
         return {
             "api": {
+                "exchange_id": exchange_id,
                 "key": api_key,
                 "secret": api_secret,
                 "save_credentials": save_credentials,
