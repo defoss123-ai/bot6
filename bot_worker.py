@@ -21,7 +21,6 @@ class PairWorker:
         initial_stats: dict[str, float | int],
         api_key: str,
         api_secret: str,
-        exchange_id: str,
     ) -> None:
         self.pair = pair
         self.event_queue = event_queue
@@ -29,7 +28,6 @@ class PairWorker:
         self.settings = settings
         self.api_key = api_key
         self.api_secret = api_secret
-        self.exchange_id = exchange_id
         self.status = "STOPPED"
         self.cycle_count = int(initial_stats.get("cycle", 0))
         self.pnl_usdt = float(initial_stats.get("pnl_usdt", 0.0))
@@ -38,7 +36,13 @@ class PairWorker:
         self.invested_usdt = float(initial_stats.get("invested_usdt", 0.0))
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._exchange = self._build_exchange(api_key, api_secret)
+        self._exchange = ccxt.mexc(
+            {
+                "apiKey": api_key,
+                "secret": api_secret,
+                "enableRateLimit": True,
+            }
+        )
         self._state = "IDLE"
         self._entry_price = 0.0
         self._avg_price = 0.0
@@ -230,6 +234,7 @@ class PairWorker:
                 if not self.tp_active and now - self._last_tp_attempt >= 5:
                     self._last_tp_attempt = now
                     self._place_take_profit_order(take_profit_pct, reason="retry")
+                    self._place_take_profit_order(take_profit_pct)
                 if self.tp_order_id and self.tp_active:
                     tp_order = self._safe_fetch_order(self.tp_order_id)
                     if tp_order and tp_order.get("status") == "closed":
@@ -362,39 +367,6 @@ class PairWorker:
         if not ok:
             return None
         return result
-
-    def _build_exchange(self, api_key: str, api_secret: str) -> ccxt.Exchange:
-        exchange_id = (self.exchange_id or "mexc").lower()
-        if exchange_id == "bybit":
-            exchange = ccxt.bybit(
-                {
-                    "apiKey": api_key,
-                    "secret": api_secret,
-                    "enableRateLimit": True,
-                    "options": {"defaultType": "spot"},
-                }
-            )
-        elif exchange_id == "htx":
-            exchange = ccxt.htx(
-                {
-                    "apiKey": api_key,
-                    "secret": api_secret,
-                    "enableRateLimit": True,
-                }
-            )
-        else:
-            exchange = ccxt.mexc(
-                {
-                    "apiKey": api_key,
-                    "secret": api_secret,
-                    "enableRateLimit": True,
-                }
-            )
-        try:
-            exchange.load_markets()
-        except Exception as exc:
-            self.logger.warning("Failed to load markets for %s: %s", exchange_id, exc)
-        return exchange
 
     def _place_take_profit_order(self, take_profit_pct: float, reason: str) -> bool:
         if self.tp_active and self.tp_order_id:

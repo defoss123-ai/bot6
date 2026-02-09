@@ -32,46 +32,6 @@ class QueueHandler(logging.Handler):
         self.log_queue.put(message)
 
 
-def normalize_symbol(symbol: str) -> str:
-    cleaned = symbol.strip().upper()
-    if "/" in cleaned:
-        return cleaned
-    if cleaned.endswith("USDT") and len(cleaned) > 4:
-        return f"{cleaned[:-4]}/USDT"
-    return cleaned
-
-
-def build_exchange(exchange_id: str, api_key: str, api_secret: str) -> ccxt.Exchange:
-    exchange_id = exchange_id.lower()
-    if exchange_id == "bybit":
-        exchange = ccxt.bybit(
-            {
-                "apiKey": api_key,
-                "secret": api_secret,
-                "enableRateLimit": True,
-                "options": {"defaultType": "spot"},
-            }
-        )
-    elif exchange_id == "htx":
-        exchange = ccxt.htx(
-            {
-                "apiKey": api_key,
-                "secret": api_secret,
-                "enableRateLimit": True,
-            }
-        )
-    else:
-        exchange = ccxt.mexc(
-            {
-                "apiKey": api_key,
-                "secret": api_secret,
-                "enableRateLimit": True,
-            }
-        )
-    exchange.load_markets()
-    return exchange
-
-
 class App:
     def __init__(
         self,
@@ -91,7 +51,6 @@ class App:
         self.workers: dict[str, PairWorker] = {}
         self._pair_stats: dict[str, dict[str, float]] = {}
         self._rsi_timeframes = ["1m", "5m", "15m", "1h", "4h", "1d"]
-        self._exchange_labels = {"MEXC": "mexc", "HTX": "htx", "BYBIT": "bybit"}
 
         self.root.title("DCA Bot")
         self._build_ui()
@@ -317,12 +276,10 @@ class App:
                     initial_stats,
                     api_key,
                     api_secret,
-                    exchange_id,
                 )
                 self.workers[pair] = worker
             worker.start()
             values[1] = worker.status
-            values[0] = pair
             self.pairs_tree.item(selected, values=values)
             self.logger.info("Pair started: %s", pair)
             self._save_state()
