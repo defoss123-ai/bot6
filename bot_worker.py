@@ -8,7 +8,7 @@ from typing import Any
 
 import ccxt
 
-from indicators import get_rsi
+from indicators import evaluate_entry_filters_with_reason
 
 
 class PairWorker:
@@ -21,6 +21,7 @@ class PairWorker:
         initial_stats: dict[str, float | int],
         api_key: str,
         api_secret: str,
+        exchange_id: str,
     ) -> None:
         self.pair = pair
         self.event_queue = event_queue
@@ -28,6 +29,7 @@ class PairWorker:
         self.settings = settings
         self.api_key = api_key
         self.api_secret = api_secret
+        self.exchange_id = exchange_id
         self.status = "STOPPED"
         self.cycle_count = int(initial_stats.get("cycle", 0))
         self.pnl_usdt = float(initial_stats.get("pnl_usdt", 0.0))
@@ -36,13 +38,8 @@ class PairWorker:
         self.invested_usdt = float(initial_stats.get("invested_usdt", 0.0))
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._exchange = ccxt.mexc(
-            {
-                "apiKey": api_key,
-                "secret": api_secret,
-                "enableRateLimit": True,
-            }
-        )
+        self._exchange = self._build_exchange(api_key, api_secret)
+        self._exchange.timeout = 15000
         self._state = "IDLE"
         self._entry_price = 0.0
         self._avg_price = 0.0
@@ -74,13 +71,20 @@ class PairWorker:
             return
         self._stop_event.clear()
         self.status = "RUNNING"
-        self._thread = threading.Thread(target=self._run, name=f"PairWorker-{self.pair}", daemon=True)
+        self._thread = threading.Thread(target=self._run_safe, name=f"PairWorker-{self.pair}", daemon=True)
         self._thread.start()
         self.logger.info("Worker started for %s", self.pair)
 
+    def _run_safe(self) -> None:
+        try:
+            self._run()
+        except Exception:
+            self.status = "ERROR"
+            self.logger.exception("Worker runtime error for %s", self.pair)
+            self.event_queue.put({"type": "pair_update", "pair": self.pair, "status": "ERROR"})
+
     def stop(self) -> None:
         self._stop_event.set()
-        self._cancel_open_orders()
         self.status = "STOPPED"
         self.logger.info("Worker stop requested for %s", self.pair)
 
@@ -92,6 +96,25 @@ class PairWorker:
         return self._thread is not None and self._thread.is_alive() and not self._stop_event.is_set()
 
     def _run(self) -> None:
+        self.logger.info("Reconcile start for %s", self.pair)
+        open_orders_ok, open_orders = self._safe_ccxt_call(self._exchange.fetch_open_orders, self.pair)
+        balance_ok, _ = self._safe_ccxt_call(self._exchange.fetch_balance)
+        if open_orders_ok and balance_ok:
+            for order in open_orders:
+                side = str(order.get("side") or "").lower()
+                status = str(order.get("status") or "").lower()
+                order_id = str(order.get("id") or "")
+                if status != "open" or not order_id:
+                    continue
+                if side == "sell":
+                    self.tp_order_id = order_id
+                    self.tp_active = True
+                elif side == "buy" and order_id not in self.safety_order_ids:
+                    self.safety_order_ids.append(order_id)
+            if self.tp_active:
+                self._state = "TP_PLACED"
+                self.logger.info("TP restored for %s (id=%s)", self.pair, self.tp_order_id)
+
         while not self._stop_event.is_set():
             time.sleep(1)
             self.cycle_count += 1
@@ -109,7 +132,7 @@ class PairWorker:
                 continue
 
             strategy = self.settings.get("strategy", {})
-            rsi_settings = self.settings.get("rsi", {})
+            filters_settings = self.settings.get("filters", self.settings.get("rsi", {}))
             take_profit_pct = float(strategy.get("take_profit_pct", 1.0))
             base_order_usdt = float(strategy.get("base_order_usdt", 10.0))
             safety_orders_count = int(strategy.get("safety_orders_count", 0))
@@ -121,30 +144,18 @@ class PairWorker:
 
             if self._state == "IDLE":
                 can_enter = True
-                if bool(rsi_settings.get("enabled", False)):
-                    now = time.time()
-                    if now - self._last_rsi_check >= 10:
-                        try:
-                            rsi_value = get_rsi(
-                                self._exchange,
-                                self.pair,
-                                str(rsi_settings.get("timeframe", "15m")),
-                                int(rsi_settings.get("period", 14)),
-                            )
-                            threshold = float(rsi_settings.get("threshold", 30))
-                            can_enter = rsi_value < threshold
-                            self._last_rsi_check = now
-                            self.logger.info(
-                                "RSI check for %s: value=%.2f threshold=%.2f",
-                                self.pair,
-                                rsi_value,
-                                threshold,
-                            )
-                        except Exception as exc:
-                            self.logger.warning("RSI check error for %s: %s", self.pair, exc)
-                            can_enter = False
-                    else:
+                now = time.time()
+                if now - self._last_rsi_check >= 10:
+                    try:
+                        can_enter, reason = evaluate_entry_filters_with_reason(self._exchange, self.pair, filters_settings)
+                        if not can_enter:
+                            self.logger.info("Entry blocked for %s: %s", self.pair, reason)
+                        self._last_rsi_check = now
+                    except Exception as exc:
+                        self.logger.warning("Entry filters check error for %s: %s", self.pair, exc)
                         can_enter = False
+                else:
+                    can_enter = False
 
                 if can_enter:
                     entry_limit_price = current_price * 0.999
@@ -368,6 +379,39 @@ class PairWorker:
             return None
         return result
 
+    def _build_exchange(self, api_key: str, api_secret: str) -> ccxt.Exchange:
+        exchange_id = (self.exchange_id or "mexc").lower()
+        if exchange_id == "bybit":
+            exchange = ccxt.bybit(
+                {
+                    "apiKey": api_key,
+                    "secret": api_secret,
+                    "enableRateLimit": True,
+                    "options": {"defaultType": "spot"},
+                }
+            )
+        elif exchange_id == "htx":
+            exchange = ccxt.htx(
+                {
+                    "apiKey": api_key,
+                    "secret": api_secret,
+                    "enableRateLimit": True,
+                }
+            )
+        else:
+            exchange = ccxt.mexc(
+                {
+                    "apiKey": api_key,
+                    "secret": api_secret,
+                    "enableRateLimit": True,
+                }
+            )
+        try:
+            exchange.load_markets()
+        except Exception as exc:
+            self.logger.warning("Failed to load markets for %s: %s", exchange_id, exc)
+        return exchange
+
     def _place_take_profit_order(self, take_profit_pct: float, reason: str) -> bool:
         if self.tp_active and self.tp_order_id:
             return True
@@ -505,8 +549,9 @@ class PairWorker:
             result = func(*args)
         except Exception as exc:
             self.logger.warning("CCXT call failed for %s: %s", self.pair, exc)
-            self._error_sleep = min(30, max(2, self._error_sleep * 2))
-            time.sleep(self._error_sleep)
+            sleep_for = self._error_sleep
+            self._error_sleep = min(8, max(1, self._error_sleep * 2))
+            time.sleep(sleep_for)
             return False, exc
         self._error_sleep = 1
         return True, result

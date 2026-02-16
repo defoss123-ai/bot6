@@ -17,6 +17,7 @@ from tkinter import ttk
 import ccxt
 
 from bot_worker import PairWorker
+from indicators import evaluate_entry_filters
 from indicators import get_rsi
 from storage import load_json
 from storage import save_json
@@ -30,6 +31,46 @@ class QueueHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         message = self.format(record)
         self.log_queue.put(message)
+
+
+def normalize_symbol(symbol: str) -> str:
+    cleaned = symbol.strip().upper()
+    if "/" in cleaned:
+        return cleaned
+    if cleaned.endswith("USDT") and len(cleaned) > 4:
+        return f"{cleaned[:-4]}/USDT"
+    return cleaned
+
+
+def build_exchange(exchange_id: str, api_key: str, api_secret: str) -> ccxt.Exchange:
+    exchange_id = exchange_id.lower()
+    if exchange_id == "bybit":
+        exchange = ccxt.bybit(
+            {
+                "apiKey": api_key,
+                "secret": api_secret,
+                "enableRateLimit": True,
+                "options": {"defaultType": "spot"},
+            }
+        )
+    elif exchange_id == "htx":
+        exchange = ccxt.htx(
+            {
+                "apiKey": api_key,
+                "secret": api_secret,
+                "enableRateLimit": True,
+            }
+        )
+    else:
+        exchange = ccxt.mexc(
+            {
+                "apiKey": api_key,
+                "secret": api_secret,
+                "enableRateLimit": True,
+            }
+        )
+    exchange.load_markets()
+    return exchange
 
 
 class App:
@@ -51,6 +92,7 @@ class App:
         self.workers: dict[str, PairWorker] = {}
         self._pair_stats: dict[str, dict[str, float]] = {}
         self._rsi_timeframes = ["1m", "5m", "15m", "1h", "4h", "1d"]
+        self._exchange_labels = {"MEXC": "mexc", "HTX": "htx", "BYBIT": "bybit"}
 
         self.root.title("DCA Bot")
         self._build_ui()
@@ -73,7 +115,7 @@ class App:
         notebook.add(self.api_frame, text="API")
         notebook.add(self.pairs_frame, text="Пары")
         notebook.add(self.settings_frame, text="Настройки стратегии")
-        notebook.add(self.rsi_frame, text="RSI-фильтр")
+        notebook.add(self.rsi_frame, text="Фильтры")
         notebook.add(self.stats_frame, text="Статистика")
         notebook.add(self.logs_frame, text="Логи")
 
@@ -244,16 +286,6 @@ class App:
                 return
             exchange_label = self.exchange_var.get() or "MEXC"
             exchange_id = self._exchange_labels.get(exchange_label, "mexc")
-            try:
-                exchange = build_exchange(exchange_id, api_key, api_secret)
-            except Exception as exc:
-                messagebox.showerror("Биржа", f"Не удалось загрузить рынки: {exc}")
-                self.logger.error("Failed to load markets for %s: %s", exchange_id, exc)
-                return
-            if pair not in exchange.markets:
-                messagebox.showwarning("Пара", f"Пара {pair} не найдена на бирже {exchange_label}.")
-                self.logger.warning("Symbol %s not found on %s", pair, exchange_id)
-                return
             worker = self.workers.get(pair)
             if worker is None:
                 state = self._collect_state()
@@ -276,10 +308,12 @@ class App:
                     initial_stats,
                     api_key,
                     api_secret,
+                    exchange_id,
                 )
                 self.workers[pair] = worker
             worker.start()
             values[1] = worker.status
+            values[0] = pair
             self.pairs_tree.item(selected, values=values)
             self.logger.info("Pair started: %s", pair)
             self._save_state()
@@ -361,58 +395,88 @@ class App:
         self._save_state()
 
     def _build_rsi_tab(self) -> None:
-        self.use_rsi_var = tk.BooleanVar(value=False)
-        rsi_check = ttk.Checkbutton(
-            self.rsi_frame,
-            text="Включить RSI-фильтр",
-            variable=self.use_rsi_var,
-        )
-        rsi_check.grid(row=0, column=0, columnspan=2, padx=8, pady=6, sticky=tk.W)
+        self.filter_widgets: dict[str, dict] = {}
+        self.filters_timeframe = ttk.Combobox(self.rsi_frame, values=self._rsi_timeframes, width=10, state="readonly")
+        self.filters_timeframe.set("15m")
+        ttk.Label(self.rsi_frame, text="Таймфрейм фильтров").pack(anchor=tk.W, padx=8, pady=(8, 2))
+        self.filters_timeframe.pack(anchor=tk.W, padx=8)
 
-        ttk.Label(self.rsi_frame, text="RSI < значение").grid(row=1, column=0, padx=8, pady=4, sticky=tk.W)
-        self.rsi_value_entry = ttk.Entry(self.rsi_frame, width=20)
-        self.rsi_value_entry.insert(0, "30")
-        self.rsi_value_entry.grid(row=1, column=1, padx=8, pady=4, sticky=tk.W)
+        canvas = tk.Canvas(self.rsi_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self.rsi_frame, orient="vertical", command=canvas.yview)
+        self.filters_scroll_frame = ttk.Frame(canvas)
+        self.filters_scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.filters_scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0), pady=8)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=8, padx=(0, 8))
+        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
 
-        ttk.Label(self.rsi_frame, text="Таймфрейм").grid(row=2, column=0, padx=8, pady=4, sticky=tk.W)
-        self.rsi_timeframe = ttk.Combobox(
-            self.rsi_frame,
-            values=self._rsi_timeframes,
-            width=18,
-        )
-        self.rsi_timeframe.set("15m")
-        self.rsi_timeframe.grid(row=2, column=1, padx=8, pady=4, sticky=tk.W)
+        self._build_indicator_section("rsi", "RSI", {"period": "14"})
+        self._build_indicator_section("macd", "MACD", {"macd_mode": "hist"})
+        self._build_indicator_section("ma", "Moving Average", {"ma_type": "SMA", "period": "20", "price_relation": "price>ma"})
+        self._build_indicator_section("stochastic", "Stochastic", {"k_period": "14", "d_period": "3", "smooth": "3", "cross_required": False, "cross_mode": "k>d"})
+        self._build_indicator_section("bollinger", "Bollinger %B", {"period": "20", "stddev": "2"})
+        self._build_indicator_section("adx", "ADX", {"period": "14"})
+        self._build_indicator_section("ultimate", "Ultimate Oscillator", {"p1": "7", "p2": "14", "p3": "28"})
+        self._build_indicator_section("sar", "Parabolic SAR", {"step": "0.02", "max_step": "0.2", "price_relation": "price>sar"})
+        self._build_indicator_section("mfi", "MFI", {"period": "14"})
+        self._build_indicator_section("cci", "CCI", {"period": "20"})
 
-        ttk.Label(self.rsi_frame, text="Период RSI").grid(row=3, column=0, padx=8, pady=4, sticky=tk.W)
-        self.rsi_period_entry = ttk.Entry(self.rsi_frame, width=20)
-        self.rsi_period_entry.insert(0, "14")
-        self.rsi_period_entry.grid(row=3, column=1, padx=8, pady=4, sticky=tk.W)
+        actions = ttk.Frame(self.rsi_frame)
+        actions.pack(fill=tk.X, padx=8, pady=(0, 8))
+        ttk.Button(actions, text="Сохранить фильтры", command=self._save_rsi).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Проверить фильтры по выбранной паре", command=self._check_rsi_for_selected_pair).pack(side=tk.LEFT, padx=8)
+        self.rsi_current_label = ttk.Label(actions, text="Результат фильтров: —")
+        self.rsi_current_label.pack(side=tk.LEFT, padx=8)
 
-        save_button = ttk.Button(self.rsi_frame, text="Сохранить RSI", command=self._save_rsi)
-        save_button.grid(row=4, column=0, columnspan=2, pady=8)
+    def _build_indicator_section(self, key: str, title: str, extra_defaults: dict) -> None:
+        card = ttk.LabelFrame(self.filters_scroll_frame, text=title)
+        card.pack(fill=tk.X, padx=4, pady=4)
+        enabled = tk.BooleanVar(value=False)
+        mode = ttk.Combobox(card, values=["<", ">", "between"], width=10, state="readonly")
+        mode.set("<")
+        value1 = ttk.Entry(card, width=10)
+        value1.insert(0, "30")
+        value2 = ttk.Entry(card, width=10)
+        value2.insert(0, "70")
 
-        self.rsi_current_label = ttk.Label(self.rsi_frame, text="Текущий RSI: —")
-        self.rsi_current_label.grid(row=5, column=0, columnspan=2, padx=8, pady=4, sticky=tk.W)
+        ttk.Checkbutton(card, text="Включить", variable=enabled).grid(row=0, column=0, padx=6, pady=4, sticky=tk.W)
+        ttk.Label(card, text="Условие").grid(row=0, column=1, padx=4)
+        mode.grid(row=0, column=2, padx=4)
+        value1.grid(row=0, column=3, padx=4)
+        value2.grid(row=0, column=4, padx=4)
+        widgets: dict[str, Any] = {"enabled": enabled, "mode": mode, "value1": value1, "value2": value2}
 
-        self.rsi_condition_label = ttk.Label(self.rsi_frame, text="Условие входа (RSI<threshold): —")
-        self.rsi_condition_label.grid(row=6, column=0, columnspan=2, padx=8, pady=4, sticky=tk.W)
+        col = 5
+        for field, default in extra_defaults.items():
+            if isinstance(default, bool):
+                var = tk.BooleanVar(value=default)
+                ttk.Checkbutton(card, text=field, variable=var).grid(row=0, column=col, padx=4)
+                widgets[field] = var
+            elif field in {"ma_type", "price_relation", "macd_mode", "cross_mode"}:
+                choices = {
+                    "ma_type": ["SMA", "EMA"],
+                    "price_relation": ["price>ma", "price<ma", "price>sar", "price<sar"],
+                    "macd_mode": ["hist", "macd>signal", "macd<signal"],
+                    "cross_mode": ["k>d", "k<d"],
+                }[field]
+                box = ttk.Combobox(card, values=choices, width=12, state="readonly")
+                box.set(str(default))
+                box.grid(row=0, column=col, padx=4)
+                widgets[field] = box
+            else:
+                entry = ttk.Entry(card, width=7)
+                entry.insert(0, str(default))
+                entry.grid(row=0, column=col, padx=4)
+                widgets[field] = entry
+            col += 1
 
-        check_button = ttk.Button(
-            self.rsi_frame,
-            text="Проверить RSI по выбранной паре",
-            command=self._check_rsi_for_selected_pair,
-        )
-        check_button.grid(row=7, column=0, columnspan=2, pady=8)
+        self.filter_widgets[key] = widgets
 
     def _save_rsi(self) -> None:
         if not self._validate_rsi_inputs():
             return
-        self.rsi_data = {
-            "enabled": str(self.use_rsi_var.get()),
-            "rsi_value": self.rsi_value_entry.get().strip(),
-            "timeframe": self.rsi_timeframe.get().strip(),
-            "period": self.rsi_period_entry.get().strip(),
-        }
+        self.rsi_data = self._collect_filters_state()
         self.logger.info("RSI settings saved: %s", self.rsi_data)
         self._save_state()
 
@@ -431,29 +495,58 @@ class App:
             self.pairs_tree.item(selected, values=values)
             self._save_state()
 
+        exchange_label = self.exchange_var.get() or "MEXC"
+        exchange_id = self._exchange_labels.get(exchange_label, "mexc")
+        thread = threading.Thread(
+            target=self._run_filters_check,
+            args=(exchange_id, symbol, self._collect_filters_state()),
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_filters_check(self, exchange_id: str, symbol: str, filters_state: dict) -> None:
         try:
-            threshold = float(self.rsi_value_entry.get().strip())
-            period = int(self.rsi_period_entry.get().strip())
-            timeframe = self.rsi_timeframe.get().strip() or "15m"
-            exchange_label = self.exchange_var.get() or "MEXC"
-            exchange_id = self._exchange_labels.get(exchange_label, "mexc")
             exchange = build_exchange(exchange_id, "", "")
-            rsi_value = get_rsi(exchange, symbol, timeframe, period)
-            condition_met = rsi_value < threshold
-            self.rsi_current_label.config(text=f"Текущий RSI: {rsi_value:.2f}")
-            self.rsi_condition_label.config(
-                text=f"Условие входа (RSI<threshold): {'ДА' if condition_met else 'НЕТ'}",
-            )
-            self.logger.info(
-                "RSI check for %s: value=%.2f threshold=%.2f condition=%s",
-                symbol,
-                rsi_value,
-                threshold,
-                "YES" if condition_met else "NO",
-            )
+            passed = evaluate_entry_filters(exchange, symbol, filters_state)
+            self.worker_event_queue.put({"type": "filters_check_result", "ok": True, "symbol": symbol, "passed": passed})
         except Exception as exc:
-            messagebox.showerror("RSI", "Не удалось проверить RSI. Проверьте настройки и пару.")
-            self.logger.exception("RSI check failed for %s: %s", symbol, exc)
+            self.worker_event_queue.put({"type": "filters_check_result", "ok": False, "symbol": symbol, "error": repr(exc)})
+
+    def _collect_filters_state(self) -> dict:
+        data: dict[str, Any] = {"timeframe": self.filters_timeframe.get().strip() or "15m"}
+        for key, widgets in self.filter_widgets.items():
+            item: dict[str, Any] = {"enabled": bool(widgets["enabled"].get()), "mode": widgets["mode"].get().strip(), "value1": widgets["value1"].get().strip(), "value2": widgets["value2"].get().strip()}
+            for field, widget in widgets.items():
+                if field in {"enabled", "mode", "value1", "value2"}:
+                    continue
+                if isinstance(widget, tk.BooleanVar):
+                    item[field] = bool(widget.get())
+                else:
+                    item[field] = widget.get().strip()
+            data[key] = item
+        return data
+
+    def _load_filters_state(self, saved: dict) -> None:
+        self.filters_timeframe.set(str(saved.get("timeframe", "15m")))
+        for key, widgets in self.filter_widgets.items():
+            cfg = saved.get(key, {}) if isinstance(saved, dict) else {}
+            widgets["enabled"].set(bool(cfg.get("enabled", False)))
+            widgets["mode"].set(str(cfg.get("mode", "<")))
+            widgets["value1"].delete(0, tk.END)
+            widgets["value1"].insert(0, str(cfg.get("value1", widgets["value1"].get() or "30")))
+            widgets["value2"].delete(0, tk.END)
+            widgets["value2"].insert(0, str(cfg.get("value2", widgets["value2"].get() or "70")))
+            for field, widget in widgets.items():
+                if field in {"enabled", "mode", "value1", "value2"}:
+                    continue
+                if field in cfg:
+                    if isinstance(widget, tk.BooleanVar):
+                        widget.set(bool(cfg.get(field, False)))
+                    elif isinstance(widget, ttk.Combobox):
+                        widget.set(str(cfg.get(field, "")))
+                    else:
+                        widget.delete(0, tk.END)
+                        widget.insert(0, str(cfg.get(field, "")))
 
     def _build_stats_tab(self) -> None:
         labels = [
@@ -716,37 +809,28 @@ class App:
         return True
 
     def _validate_rsi_inputs(self) -> bool:
-        threshold_text = self.rsi_value_entry.get().strip()
-        period_text = self.rsi_period_entry.get().strip()
-        timeframe = self.rsi_timeframe.get().strip()
-
-        try:
-            threshold = float(threshold_text)
-        except ValueError:
-            messagebox.showwarning("RSI", "RSI порог должен быть числом.")
-            self.logger.warning("Invalid RSI threshold: %s", threshold_text)
-            return False
-        if threshold <= 0 or threshold >= 100:
-            messagebox.showwarning("RSI", "RSI порог должен быть между 1 и 99.")
-            self.logger.warning("Invalid RSI threshold range: %s", threshold_text)
-            return False
-
-        try:
-            period = int(period_text)
-        except ValueError:
-            messagebox.showwarning("RSI", "Период RSI должен быть целым числом.")
-            self.logger.warning("Invalid RSI period: %s", period_text)
-            return False
-        if period < 2 or period > 100:
-            messagebox.showwarning("RSI", "Период RSI должен быть между 2 и 100.")
-            self.logger.warning("Invalid RSI period range: %s", period_text)
-            return False
-
+        timeframe = self.filters_timeframe.get().strip()
         if timeframe not in self._rsi_timeframes:
-            messagebox.showwarning("RSI", "Неверный таймфрейм RSI.")
-            self.logger.warning("Invalid RSI timeframe: %s", timeframe)
+            messagebox.showwarning("Фильтры", "Неверный таймфрейм фильтров.")
+            self.logger.warning("Invalid filters timeframe: %s", timeframe)
             return False
-
+        try:
+            for cfg in self._collect_filters_state().values():
+                if not isinstance(cfg, dict):
+                    continue
+                float(cfg.get("value1", 0) or 0)
+                if str(cfg.get("mode", "<")) == "between":
+                    float(cfg.get("value2", 0) or 0)
+                for field in ["period", "k_period", "d_period", "smooth", "p1", "p2", "p3"]:
+                    if field in cfg and str(cfg.get(field, "")).strip() != "":
+                        int(cfg.get(field, 0))
+                for field in ["stddev", "step", "max_step"]:
+                    if field in cfg and str(cfg.get(field, "")).strip() != "":
+                        float(cfg.get(field, 0))
+        except (TypeError, ValueError):
+            messagebox.showwarning("Фильтры", "Проверьте числовые поля фильтров.")
+            self.logger.warning("Invalid filters numeric values")
+            return False
         return True
 
     def _schedule_worker_event_processing(self) -> None:
@@ -763,6 +847,8 @@ class App:
                 self._apply_pair_update(event)
             elif event.get("type") == "api_check_result":
                 self._handle_api_check_result(event)
+            elif event.get("type") == "filters_check_result":
+                self._handle_filters_check_result(event)
 
     def _run_api_check(self, exchange_id: str, api_key: str, api_secret: str) -> None:
         try:
@@ -788,6 +874,19 @@ class App:
         self.api_details_label.config(text=f"Детали: {error_detail}")
         messagebox.showerror("API", "Не удалось проверить ключи API.")
         self.logger.error("API check ERROR: %s", error_detail)
+
+    def _handle_filters_check_result(self, event: dict) -> None:
+        if bool(event.get("ok")):
+            passed = bool(event.get("passed"))
+            symbol = str(event.get("symbol", ""))
+            self.rsi_current_label.config(text=f"Результат фильтров: {'ДА' if passed else 'НЕТ'}")
+            self.logger.info("Filters check for %s: %s", symbol, "PASS" if passed else "FAIL")
+            return
+        symbol = str(event.get("symbol", ""))
+        error_detail = str(event.get("error", "Unknown error"))
+        self.rsi_current_label.config(text="Результат фильтров: ERROR")
+        messagebox.showerror("Фильтры", "Не удалось проверить фильтры. Проверьте настройки и пару.")
+        self.logger.error("Filters check failed for %s: %s", symbol, error_detail)
 
     def _apply_pair_update(self, event: dict) -> None:
         pair = event.get("pair")
@@ -828,10 +927,17 @@ class App:
                 "use_market_entry": False,
             },
             "rsi": {
-                "enabled": False,
-                "threshold": 30,
                 "timeframe": "15m",
-                "period": 14,
+                "rsi": {"enabled": False, "mode": "<", "value1": 30, "value2": 70, "period": 14},
+                "macd": {"enabled": False, "mode": "<", "value1": 0, "value2": 0, "macd_mode": "hist"},
+                "ma": {"enabled": False, "mode": ">", "value1": 0, "value2": 0, "ma_type": "SMA", "period": 20, "price_relation": "price>ma"},
+                "stochastic": {"enabled": False, "mode": "<", "value1": 20, "value2": 80, "k_period": 14, "d_period": 3, "smooth": 3, "cross_required": False, "cross_mode": "k>d"},
+                "bollinger": {"enabled": False, "mode": "<", "value1": 0.2, "value2": 0.8, "period": 20, "stddev": 2},
+                "adx": {"enabled": False, "mode": ">", "value1": 20, "value2": 40, "period": 14},
+                "ultimate": {"enabled": False, "mode": "<", "value1": 30, "value2": 70, "p1": 7, "p2": 14, "p3": 28},
+                "sar": {"enabled": False, "mode": ">", "value1": 0, "value2": 0, "step": 0.02, "max_step": 0.2, "price_relation": "price>sar"},
+                "mfi": {"enabled": False, "mode": "<", "value1": 20, "value2": 80, "period": 14},
+                "cci": {"enabled": False, "mode": "<", "value1": -100, "value2": 100, "period": 20},
             },
             "pairs": [],
         }
@@ -869,12 +975,7 @@ class App:
         self.use_market_entry_var.set(bool(strategy.get("use_market_entry", False)))
 
         rsi = self.state.get("rsi", {})
-        self.use_rsi_var.set(bool(rsi.get("enabled", False)))
-        self.rsi_value_entry.delete(0, tk.END)
-        self.rsi_value_entry.insert(0, str(rsi.get("threshold", 30)))
-        self.rsi_timeframe.set(str(rsi.get("timeframe", "15m")))
-        self.rsi_period_entry.delete(0, tk.END)
-        self.rsi_period_entry.insert(0, str(rsi.get("period", 14)))
+        self._load_filters_state(rsi if isinstance(rsi, dict) else {})
 
         for item in self.pairs_tree.get_children():
             self.pairs_tree.delete(item)
@@ -961,14 +1062,7 @@ class App:
             "use_market_entry": strategy["use_market_entry"],
         }
 
-        rsi_threshold = self.rsi_value_entry.get().strip()
-        rsi_period = self.rsi_period_entry.get().strip()
-        rsi_state = {
-            "enabled": bool(self.use_rsi_var.get()),
-            "threshold": to_float(rsi_threshold, 30),
-            "timeframe": self.rsi_timeframe.get().strip() or "15m",
-            "period": to_int(rsi_period, 14),
-        }
+        rsi_state = self._collect_filters_state()
 
         return {
             "api": {
